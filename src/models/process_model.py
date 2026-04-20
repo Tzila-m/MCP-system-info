@@ -3,8 +3,13 @@ from typing import Any, Dict, List
 
 import psutil
 
-_MB = 1024**2
-THRESHOLD_MEMORY_MB = 500  
+
+BYTES_TO_MB = 1024 ** 2
+THRESHOLD_MEMORY_MB = 500
+TERMINATION_TIMEOUT_SEC = 3
+IGNORED_EXCEPTIONS = (psutil.NoSuchProcess, psutil.AccessDenied)
+
+
 
 @dataclass(frozen=True)
 class ProcessInfo:
@@ -15,57 +20,70 @@ class ProcessInfo:
     memory_usage: float
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert the ProcessInfo object to a dictionary for further usage or embedding.
-        """
         return asdict(self)
 
 
-def create_process(pid: int) -> ProcessInfo:
-    proc = psutil.Process(pid)
+# =======================
+# Mapping & Fetching
+# =======================
+
+def fetch_process(pid: int) -> psutil.Process:
+    return psutil.Process(pid)
+
+
+def map_to_process_info(proc: psutil.Process) -> ProcessInfo:
     return ProcessInfo(
         pid=proc.pid,
         name=proc.name(),
         status=proc.status(),
         cpu_usage=proc.cpu_percent(interval=0),
-        memory_usage=proc.memory_info().rss / _MB,
+        memory_usage=proc.memory_info().rss / BYTES_TO_MB,
     )
+
+
+def create_process(pid: int) -> ProcessInfo:
+    proc = fetch_process(pid)
+    return map_to_process_info(proc)
+
+
+# =======================
+# Core Functions
+# =======================
 
 def get_processes(limit: int) -> List[ProcessInfo]:
     result: List[ProcessInfo] = []
 
-    for proc in psutil.process_iter(["pid"]):
+    for proc in psutil.process_iter():
         try:
             result.append(create_process(proc.pid))
             if len(result) >= limit:
                 break
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except IGNORED_EXCEPTIONS:
             continue
 
     return result
 
+
+def is_high_memory(proc: psutil.Process, threshold: float) -> bool:
+    return (proc.memory_info().rss / BYTES_TO_MB) > threshold
+
+
 def check_high_resource_usage(memory_threshold_mb: float = THRESHOLD_MEMORY_MB) -> List[ProcessInfo]:
     high_usage: List[ProcessInfo] = []
 
-    for proc in psutil.process_iter(["pid"]):
+    for proc in psutil.process_iter():
         try:
-            proc_obj = psutil.Process(proc.info["pid"])
-            memory_mb = proc_obj.memory_info().rss / _MB
-            if memory_mb > memory_threshold_mb:
-                high_usage.append(create_process(proc_obj.pid))
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            if is_high_memory(proc, memory_threshold_mb):
+                high_usage.append(map_to_process_info(proc))
+        except IGNORED_EXCEPTIONS:
             continue
 
     return high_usage
 
 
 def get_root_parent(pid: int) -> psutil.Process | None:
-    """
-    Walk up the parent chain while parent has the same executable name.
-    This helps map worker PIDs (e.g., Code.exe child) to app-root PID.
-    """
     try:
-        proc = psutil.Process(pid)
+        proc = fetch_process(pid)
         name = proc.name()
         current = proc
 
@@ -77,12 +95,40 @@ def get_root_parent(pid: int) -> psutil.Process | None:
             try:
                 if parent.name() != name:
                     return current
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except IGNORED_EXCEPTIONS:
                 return current
 
             current = parent
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
+    except (psutil.Error, *IGNORED_EXCEPTIONS):
         return None
+
+
+# =======================
+# Termination Logic (Refactored)
+# =======================
+
+def collect_process_tree(proc: psutil.Process) -> List[psutil.Process]:
+    processes = proc.children(recursive=True)
+    processes.append(proc)
+    return processes
+
+
+def terminate_processes(processes: List[psutil.Process]) -> None:
+    for process in processes:
+        try:
+            process.terminate()
+        except IGNORED_EXCEPTIONS:
+            continue
+
+
+def kill_remaining_processes(processes: List[psutil.Process]) -> None:
+    _, alive = psutil.wait_procs(processes, timeout=TERMINATION_TIMEOUT_SEC)
+
+    for process in alive:
+        try:
+            process.kill()
+        except IGNORED_EXCEPTIONS:
+            continue
 
 
 def terminate_process(pid: int) -> bool:
@@ -91,25 +137,12 @@ def terminate_process(pid: int) -> bool:
         if root_proc is None:
             return False
 
-        proc = root_proc
-        processes_to_stop = proc.children(recursive=True)
-        processes_to_stop.append(proc)
+        processes_to_stop = collect_process_tree(root_proc)
 
-        for process in processes_to_stop:
-            try:
-                process.terminate()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+        terminate_processes(processes_to_stop)
+        kill_remaining_processes(processes_to_stop)
 
-        _, alive = psutil.wait_procs(processes_to_stop, timeout=3)
-
-        for process in alive:
-            try:
-                process.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        # Only report success if target PID actually disappeared.
         return not psutil.pid_exists(pid)
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
+
+    except (psutil.Error, *IGNORED_EXCEPTIONS):
         return False
