@@ -59,14 +59,57 @@ def check_high_resource_usage(memory_threshold_mb: float = THRESHOLD_MEMORY_MB) 
     return high_usage
 
 
-def terminate_process(pid: int) -> bool:
+def get_root_parent(pid: int) -> psutil.Process | None:
+    """
+    Walk up the parent chain while parent has the same executable name.
+    This helps map worker PIDs (e.g., Code.exe child) to app-root PID.
+    """
     try:
         proc = psutil.Process(pid)
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except psutil.TimeoutExpired:
-            proc.kill()
-        return True
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        name = proc.name()
+        current = proc
+
+        while True:
+            parent = current.parent()
+            if parent is None:
+                return current
+
+            try:
+                if parent.name() != name:
+                    return current
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return current
+
+            current = parent
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
+        return None
+
+
+def terminate_process(pid: int) -> bool:
+    try:
+        root_proc = get_root_parent(pid)
+        if root_proc is None:
+            return False
+
+        proc = root_proc
+        processes_to_stop = proc.children(recursive=True)
+        processes_to_stop.append(proc)
+
+        for process in processes_to_stop:
+            try:
+                process.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        _, alive = psutil.wait_procs(processes_to_stop, timeout=3)
+
+        for process in alive:
+            try:
+                process.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        # Only report success if target PID actually disappeared.
+        return not psutil.pid_exists(pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
         return False
